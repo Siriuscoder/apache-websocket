@@ -27,13 +27,19 @@
 #include "apr_base64.h"
 #include "apr_sha1.h"
 #include "apr_strings.h"
+#include "apr_tables.h"
+#include "apr_poll.h"
 
 #include "httpd.h"
 #include "http_config.h"
 #include "http_protocol.h"
+#include "http_log.h"
 
 #include "websocket_plugin.h"
 #include "validate_utf8.h"
+
+#include "ap_config.h"
+#include "ap_mpm.h"
 
 #define CORE_PRIVATE
 #include "http_core.h"
@@ -54,7 +60,15 @@ typedef struct
     apr_dso_handle_t *res_handle;
     WebSocketPlugin *plugin;
     apr_int64_t payload_limit;
+    char *user_config;
 } websocket_config_rec;
+
+typedef struct
+{
+    apr_array_header_t *pluginsConfig;
+} websocket_server_config_rec;
+
+extern module AP_MODULE_DECLARE_DATA websocket_module;
 
 #define BLOCK_DATA_SIZE              4096
 
@@ -151,7 +165,7 @@ static const char *mod_websocket_conf_handler(cmd_parms *cmd, void *confv,
              cmd->pool) == APR_SUCCESS) {
             if ((apr_dso_sym(&sym, res_handle, name) == APR_SUCCESS) &&
                 (sym != NULL)) {
-                WebSocketPlugin *plugin = ((WS_Init) sym) ();
+                WebSocketPlugin *plugin = ((WS_Init) sym) (conf->user_config);
                 if ((plugin != NULL) &&
                     (plugin->version == WEBSOCKET_PLUGIN_VERSION_0) &&
                     (plugin->size >= sizeof(WebSocketPlugin)) &&
@@ -161,6 +175,11 @@ static const char *mod_websocket_conf_handler(cmd_parms *cmd, void *confv,
                     apr_pool_cleanup_register(cmd->pool, conf,
                                               mod_websocket_cleanup_config,
                                               apr_pool_cleanup_null);
+                    
+                    websocket_server_config_rec* svr_config = 
+                        ap_get_module_config(cmd->server->module_config, &websocket_module);
+                    APR_ARRAY_PUSH(svr_config->pluginsConfig, websocket_config_rec *) = conf;
+                    
                     response = NULL;
                 }
                 else {
@@ -213,6 +232,7 @@ static const char *mod_websocket_conf_max_message_size(cmd_parms *cmd,
 typedef struct _WebSocketState
 {
     request_rec *r;
+    apr_socket_t *s;
     apr_bucket_brigade *obb;
     apr_thread_mutex_t *mutex;
     apr_array_header_t *protocols;
@@ -298,6 +318,7 @@ static size_t CALLBACK mod_websocket_plugin_send(const WebSocketServer *server,
     apr_uint64_t payload_length =
         (apr_uint64_t) ((buffer != NULL) ? buffer_size : 0);
     size_t written = 0;
+    apr_status_t rv;
 
     /* Deal with size more that 63 bits - FIXME */
 
@@ -352,16 +373,17 @@ static size_t CALLBACK mod_websocket_plugin_send(const WebSocketServer *server,
                 header[pos++] = FRAME_SET_LENGTH(payload_length, 1);
                 header[pos++] = FRAME_SET_LENGTH(payload_length, 0);
             }
-            ap_fwrite(of, state->obb, (const char *)header, pos); /* Header */
-            if (payload_length > 0) {
-                if (ap_fwrite(of, state->obb,
+            rv = ap_fwrite(of, state->obb, (const char *)header, pos); /* Header */
+            if (rv == APR_SUCCESS && payload_length > 0) {
+                if ((rv = ap_fwrite(of, state->obb,
                               (const char *)buffer,
-                              buffer_size) == APR_SUCCESS) { /* Payload Data */
+                              buffer_size)) == APR_SUCCESS) { /* Payload Data */
                     written = buffer_size;
                 }
             }
-            if (ap_fflush(of, state->obb) != APR_SUCCESS) {
+            if ((rv = ap_fflush(of, state->obb)) != APR_SUCCESS) {
                 written = 0;
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, server->state->r, "Output error");
             }
         }
         apr_thread_mutex_unlock(state->mutex);
@@ -381,23 +403,28 @@ static void CALLBACK mod_websocket_plugin_close(const WebSocketServer *
 /*
  * Read a buffer of data from the input stream.
  */
-static apr_size_t mod_websocket_read_block(request_rec *r, char *buffer,
+static apr_int64_t mod_websocket_read_block(request_rec *r, char *buffer,
                                            apr_size_t bufsiz)
 {
     apr_status_t rv;
     apr_bucket_brigade *bb;
-    apr_size_t readbufsiz = 0;
+    apr_int64_t readbufsiz = -1;
 
     bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
     if (bb != NULL) {
-        if ((rv =
-             ap_get_brigade(r->input_filters, bb, AP_MODE_READBYTES,
-                            APR_BLOCK_READ, bufsiz)) == APR_SUCCESS) {
-            if ((rv =
-                 apr_brigade_flatten(bb, buffer, &bufsiz)) == APR_SUCCESS) {
+        if ((rv = ap_get_brigade(r->input_filters, bb, AP_MODE_READBYTES,
+            APR_BLOCK_READ, bufsiz)) == APR_SUCCESS) {
+            if ((rv = apr_brigade_flatten(bb, buffer, &bufsiz)) == APR_SUCCESS) {
                 readbufsiz = bufsiz;
             }
         }
+        else if(APR_STATUS_IS_TIMEUP(rv) || APR_STATUS_IS_EAGAIN(rv)) {
+            readbufsiz = 0;
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Input error");
+        }
+        
         apr_brigade_destroy(bb);
     }
     return readbufsiz;
@@ -466,7 +493,7 @@ typedef struct _WebSocketFrameData
  * The data framing handler requires that the server state mutex is locked by
  * the caller upon entering this function. It will be locked when leaving too.
  */
-static void mod_websocket_data_framing(const WebSocketServer *server,
+static void mod_websocket_data_framing(WebSocketServer *server,
                                        websocket_config_rec *conf,
                                        void *plugin_private)
 {
@@ -503,16 +530,62 @@ static void mod_websocket_data_framing(const WebSocketServer *server,
         WebSocketFrameData *frame = &control_frame;
         unsigned short status_code = STATUS_CODE_OK;
         unsigned char status_code_buffer[2];
+        apr_pollset_t *pollset;
+        apr_int32_t numPolled;
+        const apr_pollfd_t *ret_pfd;
 
+        /* create poll set for one socket */
+        apr_pollset_create(&pollset, 1, r->pool, 0);
+        {
+            apr_pollfd_t pfd = { r->pool, APR_POLL_SOCKET, APR_POLLIN, 0, { NULL }, NULL };
+            pfd.desc.s = server->state->s;
+            apr_pollset_add(pollset, &pfd);
+        }
+        
         /* Allow the plugin to now write to the client */
         state->obb = obb;
         apr_thread_mutex_unlock(state->mutex);
 
-        while ((framing_state != DATA_FRAMING_CLOSE) &&
-               ((block_size =
-                 mod_websocket_read_block(r, (char *)block,
-                                          sizeof(block))) > 0)) {
+        while ((framing_state != DATA_FRAMING_CLOSE))
+        {
             apr_int64_t block_offset = 0;
+            apr_status_t rv;
+            int mpmqresult;
+            block_size = 0;
+            
+            /* check apache shutdown */
+            ap_mpm_query(AP_MPMQ_MPM_STATE, &mpmqresult);
+            if(mpmqresult == AP_MPMQ_STOPPING)
+            {
+                server->close_forced = 1;
+                break;
+            }
+            
+            /* plugin idle callback */
+            if (conf->plugin->on_idle)
+                conf->plugin->on_idle(plugin_private, server);
+           
+            
+            /* wait until socket will be readable with 10 ms timeout */
+            if ((rv = apr_pollset_poll(pollset, 10000, &numPolled, &ret_pfd)) == APR_SUCCESS)
+            {
+                if (numPolled > 0 && ret_pfd[0].desc.s == server->state->s)
+                {
+                    if ((block_size = mod_websocket_read_block(r, (char *)block,
+                        sizeof(block))) < 0)
+                        break;
+                    /* read timedout */
+                    else if (block_size == 0)
+                        continue;      
+                }
+            }
+            else if (APR_STATUS_IS_TIMEUP(rv))
+                continue;
+            else
+            {
+                ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "Poll error");
+                break;
+            }
 
             while (block_offset < block_size) {
                 switch (framing_state) {
@@ -888,8 +961,10 @@ static int mod_websocket_method_handler(request_rec *r)
                                          &websocket_module);
 
                 if ((conf != NULL) && (conf->plugin != NULL)) {
+                    apr_socket_t *s = ap_get_module_config(r->connection->conn_config,
+                        &core_module);
                     WebSocketState state =
-                        { r, NULL, NULL, NULL, 0, protocol_version };
+                        { r, s, NULL, NULL, NULL, 0, protocol_version };
                     WebSocketServer server = {
                         sizeof(WebSocketServer), 1, &state,
                         mod_websocket_request, mod_websocket_header_get,
@@ -897,7 +972,11 @@ static int mod_websocket_method_handler(request_rec *r)
                         mod_websocket_protocol_count,
                         mod_websocket_protocol_index,
                         mod_websocket_protocol_set,
-                        mod_websocket_plugin_send, mod_websocket_plugin_close
+                        mod_websocket_plugin_send, 
+                        mod_websocket_plugin_close,
+                        0,
+                        conf->payload_limit,
+                        r->connection->client_ip
                     };
                     const char *sec_websocket_protocol =
                         apr_table_get(r->headers_in, "Sec-WebSocket-Protocol");
@@ -957,11 +1036,10 @@ static int mod_websocket_method_handler(request_rec *r)
                           conf->plugin->on_connect(&server)) != NULL)) {
                         /*
                          * Now that the connection has been established,
-                         * disable the socket timeout
+                         * enable the socket timeout
                          */
-                        apr_socket_timeout_set(ap_get_module_config
-                                               (r->connection->conn_config,
-                                                &core_module), -1);
+                        apr_socket_opt_set(s, APR_SO_NONBLOCK, 0);
+                        apr_socket_timeout_set(s, -1);
 
                         /* Set response status code and status line */
                         r->status = HTTP_SWITCHING_PROTOCOLS;
@@ -1009,7 +1087,89 @@ static int mod_websocket_method_handler(request_rec *r)
     return DECLINED;
 }
 
+static const char* mod_websocket_conf_user_config(cmd_parms *cmd, void *cfg, const char *arg)
+{
+    websocket_config_rec *conf = (websocket_config_rec *)cfg;
+    if (arg) 
+    {
+        conf->user_config = apr_pstrdup(cmd->pool, arg);
+    }
+
+    return NULL;
+}
+
+static apr_status_t mod_websocket_server_child_shut(void* s) 
+{
+    int i = 0;
+    websocket_server_config_rec* svr_config = 
+        ap_get_module_config(((server_rec *)s)->module_config, &websocket_module);
+    
+    if(svr_config->pluginsConfig)
+    {
+        for(; i < svr_config->pluginsConfig->nelts; ++i)
+        {
+            websocket_config_rec *pluginCfg = APR_ARRAY_IDX(svr_config->pluginsConfig, i, websocket_config_rec *);
+            if(pluginCfg && pluginCfg->plugin && pluginCfg->plugin->on_child_destroy)
+                pluginCfg->plugin->on_child_destroy(pluginCfg->plugin);
+        }
+    }
+    
+    return APR_SUCCESS;
+}
+
+static void mod_websocket_server_child_init(apr_pool_t *pchild, server_rec *s)
+{
+    int i = 0;
+    websocket_server_config_rec* svr_config = 
+        ap_get_module_config(s->module_config, &websocket_module);
+    if(svr_config->pluginsConfig)
+    {
+        for(; i < svr_config->pluginsConfig->nelts; ++i)
+        {
+            websocket_config_rec *pluginCfg = APR_ARRAY_IDX(svr_config->pluginsConfig, i, websocket_config_rec *);
+            if(pluginCfg && pluginCfg->plugin && pluginCfg->plugin->on_child_init)
+                pluginCfg->plugin->on_child_init(pluginCfg->plugin, pluginCfg->user_config);
+        }
+    }
+    
+    apr_pool_cleanup_register(pchild, s, mod_websocket_server_child_shut, 
+        mod_websocket_server_child_shut);
+}
+
+static apr_status_t mod_websocket_post_config(apr_pool_t *pchild, apr_pool_t *pchild2, apr_pool_t *pchild3, server_rec *s)
+{
+    int i = 0;
+    websocket_server_config_rec* svr_config = 
+        ap_get_module_config(s->module_config, &websocket_module);
+    if(svr_config->pluginsConfig)
+    {
+        for(; i < svr_config->pluginsConfig->nelts; ++i)
+        {
+            websocket_config_rec *pluginCfg = APR_ARRAY_IDX(svr_config->pluginsConfig, i, websocket_config_rec *);
+            if(pluginCfg && pluginCfg->plugin && pluginCfg->plugin->on_server_config)
+                pluginCfg->plugin->on_server_config(pluginCfg->plugin, pluginCfg->user_config);
+        }
+    }
+
+    return APR_SUCCESS;
+}
+
+static void *mod_websocket_create_server_config(apr_pool_t* pool, server_rec *s)
+{
+    websocket_server_config_rec *config = (websocket_server_config_rec *)
+        apr_pcalloc(pool, sizeof(websocket_server_config_rec));
+    if(config)
+    {
+        config->pluginsConfig = apr_array_make(pool, 0, sizeof(websocket_config_rec *));
+    }
+
+    return config;
+}
+
 static const command_rec websocket_cmds[] = {
+    AP_INIT_TAKE1("UserConfig", mod_websocket_conf_user_config, NULL,
+                  OR_AUTHCFG,
+                  "User configuration file"),
     AP_INIT_TAKE2("WebSocketHandler", mod_websocket_conf_handler, NULL,
                   OR_AUTHCFG,
                   "Shared library containing WebSocket implementation followed by function initialization function name"),
@@ -1025,13 +1185,17 @@ static void mod_websocket_register_hooks(apr_pool_t *p)
     /* Register for method calls. */
     ap_hook_handler(mod_websocket_method_handler, NULL, NULL,
                     APR_HOOK_FIRST - 1);
+    ap_hook_child_init(mod_websocket_server_child_init, NULL, NULL, 
+                    APR_HOOK_FIRST - 1);
+    ap_hook_post_config(mod_websocket_post_config, NULL, NULL,
+                    APR_HOOK_FIRST - 1);
 }
 
 module AP_MODULE_DECLARE_DATA websocket_module = {
     STANDARD20_MODULE_STUFF,
     mod_websocket_create_dir_config,    /* create per-directory config structure */
     NULL,                               /* merge per-directory config structures */
-    NULL,                               /* create server config structure */
+    mod_websocket_create_server_config, /* create server config structure */
     NULL,                               /* merge server config structures */
     websocket_cmds,                     /* command table */
     mod_websocket_register_hooks,       /* register hooks */

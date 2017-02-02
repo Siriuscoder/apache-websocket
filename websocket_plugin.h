@@ -88,13 +88,26 @@ extern "C"
         WS_Protocol_Set protocol_set;
         WS_Send send;
         WS_Close close;
+        unsigned int close_forced;
+        unsigned int max_message_size;
+        const char *remoteip;
     } WebSocketServer;
 
     struct _WebSocketPlugin;
 
     typedef struct _WebSocketPlugin *(CALLBACK * WS_Init)
-                                     ();
+                                     (const char *user_config);
     typedef void (CALLBACK * WS_Destroy)
+                 (struct _WebSocketPlugin *plugin);
+
+    typedef void (CALLBACK * WS_InitServerConfig)
+                 (struct _WebSocketPlugin *plugin,
+                  const char *user_config);
+   
+    typedef void (CALLBACK * WS_ChildInit)
+                 (struct _WebSocketPlugin *plugin,
+                  const char *user_config);
+    typedef void (CALLBACK * WS_ChildDestroy)
                  (struct _WebSocketPlugin *plugin);
 
     typedef void *(CALLBACK * WS_OnConnect)
@@ -110,6 +123,10 @@ extern "C"
     typedef void (CALLBACK * WS_OnDisconnect)
                  (void *plugin_private,
                   const WebSocketServer *server);
+    
+    typedef void (CALLBACK * WS_OnIdle)
+                 (void *plugin_private,
+                  const WebSocketServer *server);
 
 #define WEBSOCKET_PLUGIN_VERSION_0 0
 
@@ -121,6 +138,10 @@ extern "C"
       WS_OnConnect on_connect;
       WS_OnMessage on_message;
       WS_OnDisconnect on_disconnect;
+      WS_InitServerConfig on_server_config;
+      WS_ChildInit on_child_init;
+      WS_ChildDestroy on_child_destroy;
+      WS_OnIdle on_idle;
   } WebSocketPlugin;
 
 #if defined(__cplusplus)
